@@ -1,0 +1,214 @@
+name: Create UUP Dump Release
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - '.github/workflows/release.yml'
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 0,6,12,18 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Generate Artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        language: ['ko-kr', 'ja-jp']
+    outputs:
+      release_tag: ${{ steps.parse_release.outputs.release_tag }}
+      release_title: ${{ steps.parse_release.outputs.release_title }}
+      release_body_path: ${{ steps.parse_release.outputs.release_body_path }}
+      assets_language: ${{ steps.parse_release.outputs.assets_language }}
+      zip_map: ${{ steps.parse_release.outputs.zip_map }}
+      tag_exists: ${{ steps.check_tag_exists.outputs.exists }}
+      amd64_zip: ${{ steps.parse_release.outputs.amd64_zip }}
+      arm64_zip: ${{ steps.parse_release.outputs.arm64_zip }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv with caching
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run UUP Dump Downloader
+        run: uv run main.py -l ${{ matrix.language }}
+
+      - name: Parse release info and Generate Release Body
+        id: parse_release
+        run: |
+          VERSION=$(jq -r '.build_version' release_info.json)
+          BUILD_NAME=$(jq -r '.build_name' release_info.json)
+          LANG=$(jq -r '.language' release_info.json)
+          ZIP_MAP=$(jq -c '[.artifacts[] | {key: .arch, value: .filename}] | from_entries' release_info.json)
+          AMD64_ZIP=$(jq -r '.artifacts[] | select(.arch == "amd64") | .filename' release_info.json)
+          ARM64_ZIP=$(jq -r '.artifacts[] | select(.arch == "arm64") | .filename' release_info.json)
+          echo "release_tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "release_title=Windows 11 Build $VERSION ($BUILD_NAME)" >> $GITHUB_OUTPUT
+          echo "assets_language=$LANG" >> $GITHUB_OUTPUT
+          echo "zip_map=$ZIP_MAP" >> $GITHUB_OUTPUT
+          echo "amd64_zip=$AMD64_ZIP" >> $GITHUB_OUTPUT
+          echo "arm64_zip=$ARM64_ZIP" >> $GITHUB_OUTPUT
+          {
+            echo "## 릴리스 정보"
+            echo "- **빌드 버전**: $VERSION"
+            echo "- **빌드 이름**: $BUILD_NAME"
+            echo "- **언어**: $(jq -r '.language' release_info.json)"
+            echo ""
+            echo "## 포함된 에디션"
+            echo "### 기본 에디션"
+            jq -r '.artifacts[0].editions.base[] | "- `\(.)`"' release_info.json
+            echo ""
+            echo "### 가상 에디션"
+            jq -r '.artifacts[0].editions.virtual[] | "- `\(.)`"' release_info.json
+            echo ""
+            echo "## 변환 옵션 (ConvertConfig.ini)"
+            echo '```ini'
+            jq -r '.artifacts[0].conversion_options | to_entries[] | "\(.key) = \(.value)"' release_info.json
+            echo '```'
+            echo ""
+            echo "## 다운로드 스크립트"
+            jq -r '.artifacts[] | "- `\(.filename)` (\(.arch))"' release_info.json
+            echo ""
+            echo "---"
+            echo "> **Disclaimer from UUP Dump**"
+            echo "> - Installation images created using the scripts provided by UUP dump are meant only for **evaluation purposes**."
+            echo "> - The images and their deployments are **not supported** in any way by Microsoft Corporation."
+            echo "> - The authors are not liable for any damages caused by misuse of this project."
+            echo "> - This project is not affiliated with Microsoft Corporation."
+          } > RELEASE_BODY.md
+          echo "release_body_path=RELEASE_BODY.md" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check_tag_exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME=${{ steps.parse_release.outputs.release_tag }}
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/repos/${{ github.repository }}/git/ref/tags/$TAG_NAME")
+          if [ "$RESPONSE" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $TAG_NAME already exists. Skipping further steps."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag $TAG_NAME does not exist. Proceeding with release."
+          fi
+
+      - name: Upload all release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.parse_release.outputs.release_tag }}-release-assets-(${{ steps.parse_release.outputs.assets_language }})
+          path: |
+            ${{ steps.parse_release.outputs.amd64_zip }}
+            ${{ steps.parse_release.outputs.arm64_zip }}
+            release_info.json
+            RELEASE_BODY.md
+          if-no-files-found: error
+
+      - name: Upload AMD64 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.parse_release.outputs.amd64_zip }}
+          path: ${{ steps.parse_release.outputs.amd64_zip }}
+          if-no-files-found: error
+
+      - name: Upload ARM64 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.parse_release.outputs.arm64_zip }}
+          path: ${{ steps.parse_release.outputs.arm64_zip }}
+          if-no-files-found: error
+
+  test:
+    name: Test ISO Build (${{ matrix.arch }}) / ${{ matrix.language }}
+    runs-on: windows-2025
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        language: ['ko-kr', 'ja-jp']
+      fail-fast: false
+
+    needs: build
+    if: ${{ needs.build.outputs.tag_exists == 'false' }}
+    steps:
+      - name: Show available disk space before build
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.release_tag }}-release-assets-(${{ matrix.language }})
+
+      - name: Set ZIP env vars
+        shell: pwsh
+        run: |
+          $arch = "${{ matrix.arch }}"
+          $lang = "${{ matrix.language }}"
+          $json = Get-Content -Raw -Path "release_info.json" | ConvertFrom-Json
+          $artifact = $json.artifacts | Where-Object { $_.arch -eq $arch -and $json.language -eq $lang }
+          "ZIP_NAME=$($artifact.filename)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VERSION=$($json.build_version)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ARCH=$arch" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Extract ZIP for ${{ matrix.arch }}
+        shell: pwsh
+        run: Expand-Archive -Path $env:ZIP_NAME -DestinationPath uup -Force
+
+      - name: Patch CMD for CI
+        shell: pwsh
+        run: |
+          $cmd = "uup\uup_download_windows.cmd"
+          (Get-Content $cmd) -replace 'Start-Process -FilePath ''%COMSPEC%''.*-Verb RunAs.*', 'REM removed RunAs for CI' |
+            ForEach-Object { if ($_ -match '^\s*pause\s*$') { 'REM pause removed' } else { $_ } } |
+            Set-Content $cmd -Encoding UTF8
+
+      - name: Execute UUP Download Script
+        shell: cmd
+        run: |
+          powershell -Command "Set-ExecutionPolicy RemoteSigned -Scope Process -Force"
+          cd uup
+          call uup_download_windows.cmd
+
+      - name: Upload ISO and logs (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso-${{ needs.build.outputs.release_tag }}-${{ matrix.arch }}-(${{ matrix.language }})
+          retention-days: 14
+          path: |
+            uup\*.iso
+            uup\*.log
+            uup\*.txt
+
+  # release:
+  #   name: Create GitHub Release
+  #   runs-on: ubuntu-latest
+  #   needs: ['build', 'test']
+  #   if: ${{ needs.build.outputs.tag_exists == 'false' }}
+  #   steps:
+  #     - name: Download release assets
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: ${{ needs.build.outputs.release_tag }}-release-assets-(${{ needs.build.outputs.assets_language }})
+
+  #     - name: Create or Update Release
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         tag_name: ${{ needs.build.outputs.release_tag }}
+  #         name: ${{ needs.build.outputs.release_title }}
+  #         body_path: ${{ needs.build.outputs.release_body_path }}
+  #         files: '*.zip'
+  #         prerelease: true

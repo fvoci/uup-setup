@@ -1,0 +1,20 @@
+[project]
+name = "uup-setup"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.13.4",
+    "cloudscraper>=1.2.71",
+    "lxml>=5.4.0",
+    "requests>=2.32.4",
+]
+
+[tool.ruff]
+line-length = 80
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "tab"
+docstring-code-format = true
